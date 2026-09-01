@@ -69,10 +69,6 @@ pub(super) struct Counts {
 
     /// connection-level budget for DATA framing overhead.
     data_frame_budget: Budget,
-
-    /// Number of empty, non-final DATA frames received over the lifetime of
-    /// the connection.
-    num_recv_empty_data_frames: usize,
 }
 
 impl Counts {
@@ -91,25 +87,43 @@ impl Counts {
             max_local_error_reset_streams: config.local_max_error_reset_streams,
             num_local_error_reset_streams: 0,
             data_frame_budget: Budget::new(config.data_frame_budget),
-            num_recv_empty_data_frames: 0,
         }
     }
 
     /// Records the framing overhead of a DATA frame.
-    pub fn record_data_frame(&mut self, payload_len: usize) -> Result<(), BudgetExhausted> {
+    ///
+    /// `empty_run` is the receiving STREAM's count of consecutive empty,
+    /// non-final DATA frames. Upstream 0.4.19 counted empty non-final
+    /// frames over the LIFETIME of the connection, which kills long-lived
+    /// connections from legitimate clients whose HTTP/2 stacks emit an
+    /// empty non-final DATA frame while ending a request body — Bun's
+    /// `node:http2` does so on every grpc-js call (`HEADERS`,
+    /// `DATA(payload)`, `DATA(len=0)`, `DATA(len=0, END_STREAM)`), so the
+    /// 100th call on a connection got the whole connection killed with
+    /// GOAWAY ENHANCE_YOUR_CALM (and concurrent streams flush those empty
+    /// frames in batches, so no connection-wide run counter works either).
+    /// Empty non-final frames are legal (RFC 9113 §6.1); the flood this
+    /// cap defends against is a run of them on a stream carrying no useful
+    /// traffic, so a stream's non-empty DATA resets its run. The total
+    /// no-op frames a peer can make us process stays bounded by
+    /// max_concurrent_streams x MAX_RECV_EMPTY_DATA_FRAMES.
+    pub fn record_data_frame(
+        &mut self,
+        empty_run: &mut usize,
+        payload_len: usize,
+    ) -> Result<(), BudgetExhausted> {
         if payload_len == 0 {
-            self.num_recv_empty_data_frames = self
-                .num_recv_empty_data_frames
-                .checked_add(1)
-                .ok_or(BudgetExhausted)?;
-            if self.num_recv_empty_data_frames > MAX_RECV_EMPTY_DATA_FRAMES {
+            *empty_run = empty_run.checked_add(1).ok_or(BudgetExhausted)?;
+            if *empty_run > MAX_RECV_EMPTY_DATA_FRAMES {
                 return Err(BudgetExhausted);
             }
             Ok(())
         } else if payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
+            *empty_run = 0;
             self.data_frame_budget
                 .consume(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len)
         } else {
+            *empty_run = 0;
             self.data_frame_budget
                 .replenish(payload_len - DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
             Ok(())
@@ -396,10 +410,11 @@ mod tests {
     #[test]
     fn good_sized_data_frames_do_not_exhaust_budget() {
         let mut counts = counts();
+        let mut run = 0;
 
         for _ in 0..1_000_000 {
             counts
-                .record_data_frame(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD)
+                .record_data_frame(&mut run, DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD)
                 .unwrap();
         }
     }
@@ -407,9 +422,10 @@ mod tests {
     #[test]
     fn consumed_small_data_frames_do_not_exhaust_budget() {
         let mut counts = counts();
+        let mut run = 0;
 
         for _ in 0..1_000_000 {
-            counts.record_data_frame(1).unwrap();
+            counts.record_data_frame(&mut run, 1).unwrap();
             counts.release_data_frame(1);
         }
     }
@@ -418,27 +434,66 @@ mod tests {
     fn empty_data_frames_do_not_consume_data_frame_budget() {
         let mut counts = counts();
         counts.data_frame_budget = Budget::new(0);
+        let mut run = 0;
 
         for _ in 0..MAX_RECV_EMPTY_DATA_FRAMES {
-            counts.record_data_frame(0).unwrap();
+            counts.record_data_frame(&mut run, 0).unwrap();
         }
 
         // Empty frames have their own limit, while a non-empty small frame
         // still consumes the independently configured DATA frame budget.
-        assert!(counts.record_data_frame(0).is_err());
-        assert!(counts.record_data_frame(1).is_err());
+        assert!(counts.record_data_frame(&mut run, 0).is_err());
+        assert!(counts.record_data_frame(&mut run, 1).is_err());
     }
 
     #[test]
-    fn large_data_frames_do_not_replenish_empty_data_frame_limit() {
+    fn interleaved_empty_data_frames_do_not_trip_the_limit() {
         let mut counts = counts();
+        let mut run = 0;
 
-        for _ in 0..MAX_RECV_EMPTY_DATA_FRAMES {
-            counts.record_data_frame(0).unwrap();
+        // A well-behaved peer may send one empty non-final DATA frame per
+        // message, forever — Bun's `node:http2` ends every gRPC request
+        // body this way. Interleaved real DATA resets the stream's run.
+        for _ in 0..MAX_RECV_EMPTY_DATA_FRAMES * 4 {
+            counts.record_data_frame(&mut run, 0).unwrap();
             counts
-                .record_data_frame(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 2)
+                .record_data_frame(&mut run, DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 2)
                 .unwrap();
         }
-        assert!(counts.record_data_frame(0).is_err());
+    }
+
+    #[test]
+    fn empty_data_frame_runs_are_per_stream() {
+        let mut counts = counts();
+        let mut run_a = 0;
+        let mut run_b = 0;
+
+        // Concurrent streams can flush their empty frames in batches, so
+        // two legitimate streams' empties may arrive back to back; each
+        // stream's run is judged on its own.
+        for _ in 0..MAX_RECV_EMPTY_DATA_FRAMES * 4 {
+            counts.record_data_frame(&mut run_a, 0).unwrap();
+            counts.record_data_frame(&mut run_b, 0).unwrap();
+            counts
+                .record_data_frame(&mut run_a, DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 2)
+                .unwrap();
+            counts
+                .record_data_frame(&mut run_b, DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 2)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn consecutive_empty_data_frames_trip_the_limit() {
+        let mut counts = counts();
+        let mut run = 0;
+
+        counts
+            .record_data_frame(&mut run, DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 2)
+            .unwrap();
+        for _ in 0..MAX_RECV_EMPTY_DATA_FRAMES {
+            counts.record_data_frame(&mut run, 0).unwrap();
+        }
+        assert!(counts.record_data_frame(&mut run, 0).is_err());
     }
 }

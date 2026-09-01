@@ -233,6 +233,61 @@ async fn too_many_padded_empty_data_frames_sends_goaway() {
 }
 
 #[tokio::test]
+async fn interleaved_empty_data_frames_do_not_kill_the_connection() {
+    // The empty-frame limit bounds RUNS of empty non-final DATA frames, not
+    // their lifetime total: some legitimate HTTP/2 stacks (e.g. Bun's
+    // node:http2, hence every grpc-js client on Bun) end each message with
+    // an empty non-final DATA frame — one per call, interleaved with real
+    // payloads, on a connection that lives for thousands of calls.
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let payload = "x".repeat(256);
+
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+
+        // Well past MAX_RECV_EMPTY_DATA_FRAMES empties in total, but never
+        // two in a row.
+        for _ in 0..150 {
+            srv.send_frame(frames::data(1, payload.as_str())).await;
+            srv.send_frame(frames::data(1, "")).await;
+        }
+        srv.send_frame(frames::data(1, "hello").eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let response = client.send_request(request, true).unwrap().0;
+        let response = h2.run(response).await.unwrap();
+        // 150 * 256 + 5 bytes fit inside the default 64KiB windows, so the
+        // whole body can be collected without window updates.
+        let body = response.into_body();
+        let chunks: Vec<_> = h2.run(body.try_collect()).await.unwrap();
+
+        let received: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(received, 150 * 256 + "hello".len());
+        drop(client);
+        h2.await.unwrap();
+    };
+
+    join(mock, h2).await;
+}
+
+#[tokio::test]
 async fn too_many_small_data_frames_sends_goaway() {
     h2_support::trace_init!();
 

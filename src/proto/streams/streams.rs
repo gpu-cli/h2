@@ -644,10 +644,15 @@ impl Inner {
             // A stream can receive at most one final DATA frame, so it cannot
             // be used to create unbounded framing overhead on that stream.
             if res.is_ok() && !is_end_stream {
-                res = counts.record_data_frame(payload_len).map_err(|_| {
-                    tracing::debug!("too many small DATA frames");
-                    Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
-                });
+                res = counts
+                    .record_data_frame(&mut stream.num_recv_empty_data_frames, payload_len)
+                    .map_err(|_| {
+                        tracing::debug!("too many small DATA frames");
+                        Error::library_go_away_data(
+                            Reason::ENHANCE_YOUR_CALM,
+                            "too_many_data_frames",
+                        )
+                    });
             }
 
             // Any stream error after receiving a DATA frame means
