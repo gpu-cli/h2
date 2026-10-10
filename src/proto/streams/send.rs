@@ -274,6 +274,7 @@ impl Send {
         self.prioritize
             .queue_frame(frame.into(), buffer, stream, task);
         self.prioritize.reclaim_all_capacity(stream, counts);
+        self.prioritize.wake_if_scheduled(task);
     }
 
     pub fn schedule_implicit_reset(
@@ -292,6 +293,7 @@ impl Send {
 
         self.prioritize.reclaim_reserved_capacity(stream, counts);
         self.prioritize.schedule_send(stream, task);
+        self.prioritize.wake_if_scheduled(task);
     }
 
     pub fn send_data<B>(
@@ -340,6 +342,7 @@ impl Send {
 
         // Release any excess capacity
         self.prioritize.reserve_capacity(0, stream, counts);
+        self.prioritize.wake_if_scheduled(task);
 
         Ok(())
     }
@@ -376,8 +379,10 @@ impl Send {
         capacity: WindowSize,
         stream: &mut store::Ptr,
         counts: &mut Counts,
+        task: &mut Option<Waker>,
     ) {
-        self.prioritize.reserve_capacity(capacity, stream, counts)
+        self.prioritize.reserve_capacity(capacity, stream, counts);
+        self.prioritize.wake_if_scheduled(task);
     }
 
     pub fn poll_capacity(

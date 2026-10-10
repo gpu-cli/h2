@@ -1394,9 +1394,12 @@ impl<B> StreamRef<B> {
 
         let mut stream = me.store.resolve(self.opaque.key);
 
-        me.actions
-            .send
-            .reserve_capacity(capacity, &mut stream, &mut me.counts)
+        me.actions.send.reserve_capacity(
+            capacity,
+            &mut stream,
+            &mut me.counts,
+            &mut me.actions.task,
+        )
     }
 
     /// Returns the stream's current send capacity.

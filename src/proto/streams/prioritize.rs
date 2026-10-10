@@ -56,6 +56,13 @@ pub(super) struct Prioritize {
 
     /// The maximum amount of bytes a stream should buffer.
     max_buffer_size: usize,
+
+    /// A stream was made ready to send by capacity assigned outside the
+    /// connection task (a `reserve_capacity`, or capacity a stream gave
+    /// back), which queues it in `pending_send` without waking anyone. The
+    /// user-facing caller wakes the connection with
+    /// [`Prioritize::wake_if_scheduled`].
+    scheduled_unwoken: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -101,6 +108,7 @@ impl Prioritize {
             last_opened_id: StreamId::ZERO,
             in_flight_data_frame: InFlightData::Nothing,
             max_buffer_size: config.local_max_buffer_size,
+            scheduled_unwoken: false,
         }
     }
 
@@ -501,7 +509,22 @@ impl Prioritize {
             //
             // debug_assert!(!stream.pending_send.is_empty());
 
-            self.pending_send.push(stream);
+            if self.pending_send.push(stream) {
+                self.scheduled_unwoken = true;
+            }
+        }
+    }
+
+    /// Wake the connection if capacity assigned in this call made a stream
+    /// ready to send. Without it a stream whose buffered data was given
+    /// capacity by a user call (its own `reserve_capacity`, or another
+    /// stream giving capacity back) waits in `pending_send` until something
+    /// else wakes the connection.
+    pub fn wake_if_scheduled(&mut self, task: &mut Option<Waker>) {
+        if mem::take(&mut self.scheduled_unwoken) {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
         }
     }
 
@@ -516,6 +539,10 @@ impl Prioritize {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        // The connection is running: whatever is queued in `pending_send` is
+        // about to be popped.
+        self.scheduled_unwoken = false;
+
         // Reclaim any frame that has previously been written
         self.reclaim_frame(buffer, store, dst);
 

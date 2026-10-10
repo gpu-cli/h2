@@ -3072,3 +3072,70 @@ async fn poll_capacity_window_update_settings_race() {
 
     join(srv, h2).await;
 }
+
+/// Capacity a stream gives back with `reserve_capacity` from outside the
+/// connection task reaches a stream whose DATA is waiting for it, and that
+/// DATA goes out: the connection is woken, not left idle until some unrelated
+/// frame wakes it.
+#[tokio::test]
+async fn reserve_capacity_given_back_wakes_connection_for_waiting_data() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let (settings_tx, settings_rx) = oneshot::channel();
+    let (sent_tx, sent_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        settings_tx.send(()).unwrap();
+        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/a"))
+            .await;
+        srv.recv_frame(frames::headers(3).request("POST", "https://example.com/b"))
+            .await;
+        // Stream 1 holds the whole connection window and sends nothing; once
+        // it gives the window back, stream 3's waiting DATA must arrive.
+        srv.recv_frame(frames::data(3, vec![0u8; 16_384])).await;
+        sent_tx.send(srv).unwrap();
+    });
+
+    let (mut client, mut h2) = client::handshake(io).await.unwrap();
+    h2.drive(settings_rx).await.unwrap();
+    let request = Request::post("https://example.com/a").body(()).unwrap();
+    let (_response_a, mut a) = client.send_request(request, false).unwrap();
+    let request = Request::post("https://example.com/b").body(()).unwrap();
+    let (_response_b, mut b) = client.send_request(request, false).unwrap();
+
+    a.reserve_capacity(frame::DEFAULT_INITIAL_WINDOW_SIZE as usize);
+    let mut a = h2
+        .drive(util::wait_for_capacity(
+            a,
+            frame::DEFAULT_INITIAL_WINDOW_SIZE as usize,
+        ))
+        .await;
+
+    // No connection window is left for stream 3: its DATA is buffered.
+    b.send_data(vec![0u8; 16_384].into(), false).unwrap();
+
+    // The connection runs on its own task, so the only thing that can wake
+    // it is h2 itself.
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let connection = tokio::spawn(async move {
+        tokio::select! {
+            _ = h2 => {}
+            _ = stop_rx => {}
+        }
+        drop(client);
+    });
+    idle_ms(50).await;
+
+    // Outside the connection task: give the window back.
+    a.reserve_capacity(0);
+
+    let _srv = tokio::time::timeout(std::time::Duration::from_secs(5), sent_rx)
+        .await
+        .expect("stream 3's DATA was never sent after stream 1 gave the window back")
+        .unwrap();
+    stop_tx.send(()).unwrap();
+    connection.await.unwrap();
+    drop((a, b));
+}
